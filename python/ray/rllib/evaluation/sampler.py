@@ -199,6 +199,37 @@ class AsyncSampler(threading.Thread, SamplerInput):
                 break
         return extra
 
+class EMA(object):
+  """Exponential moving average."""
+
+  def __init__(self, learning_rate, initial_value=0):
+    self._learning_rate = learning_rate
+    self._initial_value = initial_value
+    self.reset()
+
+  def reset(self):
+    self._value = self._initial_value
+
+  def update(self, value):
+    self._value += self._learning_rate * (value - self._value)
+
+  @property
+  def value(self):
+    return self._value
+
+import time
+
+class Timer:
+  
+  def __init__(self):
+    self._time = EMA(1e-2)
+  
+  def __enter__(self):
+    self._last_time = time.time()
+
+  def __exit__(self, *unused):
+    elapsed = time.time() - self._last_time
+    self._time.update(elapsed)
 
 def _env_runner(base_env,
                 extra_batch_callback,
@@ -273,32 +304,46 @@ def _env_runner(base_env,
 
     active_episodes = defaultdict(new_episode)
 
+    timer_names = ["poll", "process_obs", "policy_eval", "process_results", "send_actions"]
+    timers = {name: Timer() for name in timer_names}
+    counter = 0
+
     while True:
-        # Get observations from all ready agents
-        unfiltered_obs, rewards, dones, infos, off_policy_actions = \
-            base_env.poll()
+        with timers["poll"]:
+            # Get observations from all ready agents
+            unfiltered_obs, rewards, dones, infos, off_policy_actions = \
+                base_env.poll()
 
-        # Process observations and prepare for policy evaluation
-        active_envs, to_eval, outputs = _process_observations(
-            base_env, policies, batch_builder_pool, active_episodes,
-            unfiltered_obs, rewards, dones, infos, off_policy_actions, horizon,
-            preprocessors, obs_filters, unroll_length, pack, callbacks)
-        for o in outputs:
-            yield o
+        with timers["process_obs"]:
+            # Process observations and prepare for policy evaluation
+            active_envs, to_eval, outputs = _process_observations(
+                base_env, policies, batch_builder_pool, active_episodes,
+                unfiltered_obs, rewards, dones, infos, off_policy_actions, horizon,
+                preprocessors, obs_filters, unroll_length, pack, callbacks)
+            for o in outputs:
+                yield o
 
-        # Do batched policy eval
-        eval_results = _do_policy_eval(tf_sess, to_eval, policies,
-                                       active_episodes)
+        with timers["policy_eval"]:
+            # Do batched policy eval
+            eval_results = _do_policy_eval(tf_sess, to_eval, policies,
+                                           active_episodes)
 
-        # Process results and update episode state
-        actions_to_send = _process_policy_eval_results(
-            to_eval, eval_results, active_episodes, active_envs,
-            off_policy_actions, policies, clip_actions)
+        with timers["process_results"]:
+            # Process results and update episode state
+            actions_to_send = _process_policy_eval_results(
+                to_eval, eval_results, active_episodes, active_envs,
+                off_policy_actions, policies, clip_actions)
 
-        # Return computed actions to ready envs. We also send to envs that have
-        # taken off-policy actions; those envs are free to ignore the action.
-        base_env.send_actions(actions_to_send)
+        with timers["send_actions"]:
+            # Return computed actions to ready envs. We also send to envs that have
+            # taken off-policy actions; those envs are free to ignore the action.
+            base_env.send_actions(actions_to_send)
 
+        counter += 1
+        
+        if counter % 100 == 0:
+            for name in timer_names:
+                print(name, '%.1f' % (1000 * timers[name]._time.value))
 
 def _process_observations(base_env, policies, batch_builder_pool,
                           active_episodes, unfiltered_obs, rewards, dones,
