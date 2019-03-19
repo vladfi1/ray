@@ -222,7 +222,7 @@ import time
 class Timer:
   
   def __init__(self):
-    self._time = EMA(1e-2)
+    self._time = EMA(1e-3)
   
   def __enter__(self):
     self._last_time = time.time()
@@ -341,7 +341,7 @@ def _env_runner(base_env,
 
         counter += 1
         
-        if counter % 100 == 0:
+        if counter % 200 == 0:
             for name in timer_names:
                 print(name, '%.1f' % (1000 * timers[name]._time.value))
 
