@@ -308,6 +308,9 @@ def _env_runner(base_env,
     timers = {name: Timer() for name in timer_names}
     counter = 0
 
+    import cProfile
+    profiler = cProfile.Profile()
+
     while True:
         with timers["poll"]:
             # Get observations from all ready agents
@@ -316,7 +319,7 @@ def _env_runner(base_env,
 
         with timers["process_obs"]:
             # Process observations and prepare for policy evaluation
-            active_envs, to_eval, outputs = _process_observations(
+            active_envs, to_eval, outputs = profiler.runcall(_process_observations,
                 base_env, policies, batch_builder_pool, active_episodes,
                 unfiltered_obs, rewards, dones, infos, off_policy_actions, horizon,
                 preprocessors, obs_filters, unroll_length, pack, callbacks)
@@ -341,7 +344,8 @@ def _env_runner(base_env,
 
         counter += 1
         
-        if counter % 200 == 0:
+        if counter % 500 == 0:
+            profiler.dump_stats('/tmp/rllib_stats')
             for name in timer_names:
                 print(name, '%.1f' % (1000 * timers[name]._time.value))
 
