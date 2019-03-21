@@ -7,6 +7,7 @@ from __future__ import division
 from __future__ import print_function
 
 import logging
+import math
 import numpy as np
 import random
 import time
@@ -15,6 +16,7 @@ import threading
 from six.moves import queue
 
 import ray
+from ray.rllib.evaluation.sample_batch import SampleBatch
 from ray.rllib.optimizers.multi_gpu_impl import LocalSyncParallelOptimizer
 from ray.rllib.optimizers.policy_optimizer import PolicyOptimizer
 from ray.rllib.utils.actors import TaskPool
@@ -112,6 +114,9 @@ class AsyncSamplesOptimizer(PolicyOptimizer):
         self.replay_proportion = replay_proportion
         self.replay_buffer_num_slots = replay_buffer_num_slots
         self.replay_batches = []
+        self.batches_needed = math.ceil(self.train_batch_size / self.sample_batch_size)
+        self.replays_needed = math.floor(self.replay_proportion * self.batches_needed)
+        self.samples_needed = self.batches_needed - self.replays_needed
 
     def add_stat_val(self, key, val):
         if key not in self._last_stats_sum:
@@ -181,24 +186,26 @@ class AsyncSamplesOptimizer(PolicyOptimizer):
             stats["learner"] = self.learner.stats
         return dict(PolicyOptimizer.stats(self), **stats)
 
+    def _send_batch(self):
+        if len(self.batch_buffer) < self.samples_needed: return False
+        replays_needed = self.batches_needed - len(self.batch_buffer)
+        if replays_needed > len(self.replay_batches): return False
+        self.batch_buffer.extend(np.random.choice(
+            self.replay_batches, size=replays_needed, replace=False))
+        train_batch = SampleBatch.concat_samples(self.batch_buffer)
+        self.learner.inqueue.put(train_batch)
+        self.batch_buffer = []
+        return True
+
     def _step(self):
         sample_timesteps, train_timesteps = 0, 0
         num_sent = 0
         weights = None
 
-        for ev, sample_batch in self._augment_with_replay(
-                self.sample_tasks.completed_prefetch()):
+        for ev, sample_batch in self.sample_tasks.completed_prefetch():
+            sample_batch = ray.get(sample_batch)
             self.batch_buffer.append(sample_batch)
-            if sum(b.count
-                   for b in self.batch_buffer) >= self.train_batch_size:
-                train_batch = self.batch_buffer[0].concat_samples(
-                    self.batch_buffer)
-                self.learner.inqueue.put(train_batch)
-                self.batch_buffer = []
-
-            # If the batch was replayed, skip the update below.
-            if ev is None:
-                continue
+            self._send_batch()  # check if we have enough to send a batch
 
             sample_timesteps += sample_batch.count
 
@@ -222,29 +229,13 @@ class AsyncSamplesOptimizer(PolicyOptimizer):
             # Kick off another sample request
             self.sample_tasks.add(ev, ev.sample.remote())
 
+        self._send_batch()  # if replay_proportion=1 we can always send a batch
+
         while not self.learner.outqueue.empty():
             count = self.learner.outqueue.get()
             train_timesteps += count
 
         return sample_timesteps, train_timesteps
-
-    def _augment_with_replay(self, sample_futures):
-        def can_replay():
-            num_needed = int(
-                np.ceil(self.train_batch_size / self.sample_batch_size))
-            return len(self.replay_batches) > num_needed
-
-        for ev, sample_batch in sample_futures:
-            sample_batch = ray.get(sample_batch)
-            yield ev, sample_batch
-
-            if can_replay():
-                f = self.replay_proportion
-                while random.random() < f:
-                    f -= 1
-                    replay_batch = random.choice(self.replay_batches)
-                    self.num_replayed += replay_batch.count
-                    yield None, replay_batch
 
 
 class LearnerThread(threading.Thread):
@@ -426,7 +417,7 @@ class MinibatchBuffer(object):
            inqueue: Queue to populate the internal ring buffer from.
            size: Max number of data items to buffer.
            num_passes: Max num times each data item should be emitted.
-       """
+        """
         self.inqueue = inqueue
         self.size = size
         self.max_ttl = num_passes
